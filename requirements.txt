@@ -1,0 +1,7 @@
+numpy
+xarray
+netCDF4
+torch
+diffusers
+earthkit-meteo
+onnxruntime-gpu[cuda,cudnn]
