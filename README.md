@@ -12,12 +12,25 @@ model source code.
 | `static.npz` | Grid lat/lon, static input fields (topography, sin(lat), cell area), normalisation mean/std |
 | `requirements.txt` | Python dependencies |
 
-The model itself is **not** part of this repository. Put these two files next to `infer.py`:
+## Download the model and the test data
 
-| File | What it is |
-|---|---|
-| `model.onnx` | Network graph, float32 (2.5 MB) |
-| `model.onnx.data` | Network weights (2.5 GB), loaded automatically by `model.onnx` |
+The model parameters and a sample initial condition are **not** part of this repository. They are on Google Drive:
+
+| What | Google Drive folder | Files |
+|---|---|---|
+| Model parameters | [parameter](https://drive.google.com/drive/folders/1olUrGP9VdJE_xIyLSJc1dbkdDU9QZAWd) | `model.onnx` (network graph, 2.5 MB), `model.onnx.data` (float32 weights, 2.5 GB) |
+| Test data | [data](https://drive.google.com/drive/folders/1zVZjoLrfLt_qJgqxTtXmMGQ8fH5OEiQj) | `2025040100.nc` (initial condition, 2025-04-01 00 UTC, 67 MB) |
+
+Both folders are in <https://drive.google.com/drive/folders/1SjOpyRy-aqo_wKyN9_-o3xMn_wOOUqCS?usp=sharing>.
+
+Put `model.onnx` and `model.onnx.data` next to `infer.py` (do not rename them; `model.onnx` loads the
+weights by file name) and the test data in `data/`. From the command line:
+
+```bash
+pip install gdown
+gdown --folder https://drive.google.com/drive/folders/1olUrGP9VdJE_xIyLSJc1dbkdDU9QZAWd -O .       # model parameters
+gdown --folder https://drive.google.com/drive/folders/1zVZjoLrfLt_qJgqxTtXmMGQ8fH5OEiQj -O data    # test data
+```
 
 ## Install
 
@@ -31,7 +44,7 @@ releases up to 1.26 use CUDA 12, newer ones CUDA 13.
 ## Run
 
 ```bash
-python infer.py --init 2025040100.nc --out forecast.nc
+python infer.py --init data/2025040100.nc --out forecast.nc
 ```
 
 | Option | Default | Meaning |
