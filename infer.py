@@ -2,7 +2,7 @@
 
 Usage
 -----
-    python infer.py --init 2025040100.nc --out forecast.nc
+    python infer.py --init data/2025040100.nc --out forecast.nc
 
 Method
 ------
@@ -36,11 +36,17 @@ The network works with normalised fields ((x - mean) / std per channel) and with
 flipped along Ydim relative to the NetCDF files. Inside this script, arrays named `*_norm` are in
 that network convention; everything read from or written to disk is in physical units and file
 orientation. `to_network()` and `to_physical()` convert between the two.
+
+Output grid
+-----------
+By default the forecast is conservatively regridded to the 0.25 degree ERA5 latitude-longitude grid
+(721 x 1440) with the weights in remap/; `--grid c192` keeps the native cubed-sphere grid.
 """
 import argparse
 import datetime as dt
 import time
 
+import netCDF4
 import numpy as np
 import onnxruntime as ort
 import torch
@@ -48,26 +54,10 @@ import xarray as xr
 from diffusers import DDIMScheduler
 from earthkit.meteo.solar import cos_solar_zenith_angle
 
-# ======================== Model constants ========================
-PRESSURE_LEVELS = [1000, 925, 850, 700, 600, 500, 400, 300, 250, 200, 150, 100, 50]   # hPa
-PRESSURE_VARS = [
-    "geopotential",
-    "specific_humidity",
-    "temperature",
-    "u_component_of_wind",
-    "v_component_of_wind",
-]
-SURFACE_VARS = [
-    "mean_sea_level_pressure",
-    "10m_u_component_of_wind",
-    "10m_v_component_of_wind",
-    "2m_temperature",
-]
-GRID_DIMS = ("nf", "Ydim", "Xdim")
-GRID_SHAPE = (6, 192, 192)
-N_LEVELS = len(PRESSURE_LEVELS)                         # 13
-N_PRESSURE_CHANNELS = len(PRESSURE_VARS) * N_LEVELS     # 65
-N_STATE_CHANNELS = N_PRESSURE_CHANNELS + len(SURFACE_VARS)   # 69
+from common import (C192_DIMS, C192_SHAPE, LATITUDES, LATLON_DIMS, LATLON_SHAPE, LONGITUDES,
+                    N_LEVELS, N_PRESSURE_CHANNELS, N_STATE_CHANNELS, PRESSURE_LEVELS,
+                    PRESSURE_VARS, SURFACE_VARS, UNITS, Regridder)
+
 STEP_HOURS = 12
 
 
@@ -124,41 +114,70 @@ def read_initial_condition(path):
 
         channels = []
         for name in PRESSURE_VARS:
-            channels.append(ds[name].values.reshape(N_LEVELS, *GRID_SHAPE))
+            channels.append(ds[name].values.reshape(N_LEVELS, *C192_SHAPE))
         for name in SURFACE_VARS:
-            channels.append(ds[name].values.reshape(1, *GRID_SHAPE))
+            channels.append(ds[name].values.reshape(1, *C192_SHAPE))
         state = np.concatenate(channels, axis=0)
 
-        cos_sza = ds["cosine_solar_zenith_angle"].values.reshape(1, *GRID_SHAPE)
+        cos_sza = ds["cosine_solar_zenith_angle"].values.reshape(1, *C192_SHAPE)
         init_time = ds["time"].values.reshape(-1)[0].astype("datetime64[s]").astype(dt.datetime)
 
     return state.astype(np.float32), cos_sza.astype(np.float32), init_time
 
 
-def write_forecast(path, states, valid_times, init_time, static):
-    """Write the forecast to NetCDF.
+def write_forecast(path, states, valid_times, init_time, static, regridder=None):
+    """Write the forecast to NetCDF, one time step at a time.
 
-    states: (n_times, 69, 6, 192, 192), physical units, file orientation.
+    states    : (n_times, 69, 6, 192, 192), physical units, file orientation
+    regridder : C192 -> 0.25 degree lat-lon Regridder, or None to keep the C192 grid
+
+    Variables have dimensions (time, level, *grid) or (time, *grid), where grid is
+    (latitude, longitude) or (nf, Ydim, Xdim).
     """
-    data_vars = {}
-    for i, name in enumerate(PRESSURE_VARS):
-        first = i * N_LEVELS
-        data_vars[name] = (("time", "level") + GRID_DIMS, states[:, first:first + N_LEVELS])
-    for i, name in enumerate(SURFACE_VARS):
-        data_vars[name] = (("time",) + GRID_DIMS, states[:, N_PRESSURE_CHANNELS + i])
+    with netCDF4.Dataset(path, "w") as nc:
+        nc.model = "CAST3 C192"
+        nc.init_time = init_time.isoformat()
 
-    ds = xr.Dataset(
-        data_vars,
-        coords={
-            "time": np.array(valid_times, dtype="datetime64[ns]"),
-            "level": PRESSURE_LEVELS,
-            "lat": (GRID_DIMS, static["lat"]),
-            "lon": (GRID_DIMS, static["lon"]),
-        },
-        attrs={"model": "CAST3 C192", "init_time": init_time.isoformat()},
-    )
-    compression = {name: {"zlib": True, "complevel": 1} for name in data_vars}
-    ds.to_netcdf(path, encoding=compression)
+        nc.createDimension("time", len(valid_times))
+        nc.createDimension("level", N_LEVELS)
+        nc.createVariable("time", "i4", ("time",))
+        nc["time"].units = f"hours since {init_time:%Y-%m-%d %H:%M:%S}"
+        nc["time"][:] = [(t - init_time) // dt.timedelta(hours=1) for t in valid_times]
+        nc.createVariable("level", "i4", ("level",))
+        nc["level"].units = "hPa"
+        nc["level"][:] = PRESSURE_LEVELS
+
+        if regridder is None:
+            grid_dims, grid_size = C192_DIMS, C192_SHAPE
+            coords = {"lat": (C192_DIMS, static["lat"]), "lon": (C192_DIMS, static["lon"])}
+        else:
+            grid_dims, grid_size = LATLON_DIMS, LATLON_SHAPE
+            coords = {"latitude": (("latitude",), LATITUDES), "longitude": (("longitude",), LONGITUDES)}
+        for name, size in zip(grid_dims, grid_size):
+            nc.createDimension(name, size)
+        for name, (dims, values) in coords.items():
+            nc.createVariable(name, "f8", dims)
+            nc[name][:] = values
+            nc[name].units = "degrees_north" if name.startswith("lat") else "degrees_east"
+
+        for name in PRESSURE_VARS:
+            nc.createVariable(name, "f4", ("time", "level") + grid_dims, zlib=True, complevel=1,
+                              chunksizes=(1, 1) + grid_size)
+        for name in SURFACE_VARS:
+            nc.createVariable(name, "f4", ("time",) + grid_dims, zlib=True, complevel=1,
+                              chunksizes=(1,) + grid_size)
+        for name in PRESSURE_VARS + SURFACE_VARS:
+            nc[name].units = UNITS[name]
+            if regridder is None:
+                nc[name].coordinates = "lat lon"
+
+        for i, state in enumerate(states):
+            if regridder is not None:
+                state = regridder(state)                      # (69, 721, 1440)
+            for j, name in enumerate(PRESSURE_VARS):
+                nc[name][i] = state[j * N_LEVELS:(j + 1) * N_LEVELS]
+            for j, name in enumerate(SURFACE_VARS):
+                nc[name][i] = state[N_PRESSURE_CHANNELS + j]
 
 
 # ======================== Diffusion model ========================
@@ -202,7 +221,7 @@ def sample_increment(network, scheduler, cond, generator):
 
     cond: (1, 73, 6, 192, 192) float32. Returns (69, 6, 192, 192) float32.
     """
-    sample = torch.randn((1, N_STATE_CHANNELS) + GRID_SHAPE, generator=generator)
+    sample = torch.randn((1, N_STATE_CHANNELS) + C192_SHAPE, generator=generator)
 
     for t in scheduler.timesteps:
         inputs = {
@@ -252,6 +271,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description="CAST3 C192 global weather forecast")
     parser.add_argument("--init", required=True, help="C192 initial-condition NetCDF")
     parser.add_argument("--out", default="forecast.nc", help="output NetCDF")
+    parser.add_argument("--grid", choices=["latlon", "c192"], default="latlon",
+                        help="output grid: 0.25 degree lat-lon (ERA5 grid) or the native C192 grid")
     parser.add_argument("--days", type=float, default=10, help="forecast length in days")
     parser.add_argument("--ddim-steps", type=int, default=20,
                         help="DDIM denoising steps per 12 h step")
@@ -259,6 +280,8 @@ def parse_args():
                         help="seed of the diffusion noise; each seed gives one ensemble member")
     parser.add_argument("--model", default="model.onnx", help="ONNX model")
     parser.add_argument("--static", default="static.npz", help="grid, static fields, normalisation")
+    parser.add_argument("--weights", default="remap/c192_to_era5_conserve.npz",
+                        help="regridding weights C192 -> lat-lon (for --grid latlon)")
     parser.add_argument("--device", type=int, default=0, help="GPU id")
     return parser.parse_args()
 
@@ -272,13 +295,16 @@ def main():
     network = load_network(args.model, args.device)
     scheduler = build_scheduler(args.ddim_steps)
     generator = torch.Generator().manual_seed(args.seed)
+    regridder = None
+    if args.grid == "latlon":
+        regridder = Regridder(args.weights, C192_SHAPE, LATLON_SHAPE)
 
     print(f"init {init_time:%Y-%m-%d %H}Z | {n_steps} x {STEP_HOURS} h | "
           f"{args.ddim_steps} DDIM steps | seed {args.seed}")
     states, valid_times = run_forecast(network, scheduler, static, state, cos_sza, init_time,
                                        n_steps, generator)
 
-    write_forecast(args.out, states, valid_times, init_time, static)
+    write_forecast(args.out, states, valid_times, init_time, static, regridder)
     print("saved", args.out)
 
 
