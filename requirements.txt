@@ -1,6 +1,11 @@
 numpy
+scipy
+pandas
 xarray
 netCDF4
+gcsfs             # only for prepare_init.py --download
+zarr              # only for prepare_init.py --download
+cfgrib            # only needed to read ERA5 GRIB files in prepare_init.py
 torch
 diffusers
 earthkit-meteo
